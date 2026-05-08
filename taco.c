@@ -167,9 +167,10 @@ static int tacoCompress (int argc, char *argv[])
       oneWriteLine (ofTaco, 'c', 0, 0) ;
       oneWriteLine (ofTaco, 'I', strlen(sqioId(inIO)), sqioId(inIO)) ;
 
-      /* write .1seq: compressed sequence first, then removed DNA directly from source */
+      /* write .1seq: compressed sequence only (one S per sequence) */
       oneWriteLine (ofSeq, 'S', nNew, tacoSeq) ;
 
+      /* write L events + removed DNA S lines to .1taco */
       int j ;
       for (j = 0 ; j < arrayMax(seqLift) ; ++j)
 	{ SalsaEntry *e = arrp(seqLift, j, SalsaEntry) ;
@@ -179,7 +180,8 @@ static int tacoCompress (int argc, char *argv[])
 	  oneInt(ofTaco,3) = e->unit_len ;
 	  oneWriteLine (ofTaco, 'L', 0, 0) ;
 	  I64 removedLen = e->orig_end - e->orig_start - e->unit_len ;
-	  oneWriteLine (ofSeq, 'S', removedLen, oldSeq + e->orig_start + e->unit_len) ;
+	  if (removedLen > 0)
+	    oneWriteLine (ofTaco, 'S', removedLen, oldSeq + e->orig_start + e->unit_len) ;
 	}
 
       /* optionally write FASTA */
@@ -350,9 +352,10 @@ static int tacoCollapse (int argc, char *argv[])
       oneWriteLine (ofTaco, 'c', 0, 0) ;
       oneWriteLine (ofTaco, 'I', strlen(sqioId(inIO)), sqioId(inIO)) ;
 
-      /* write .1seq: compressed sequence */
+      /* write .1seq: compressed sequence only */
       oneWriteLine (ofSeq, 'S', nNew, outBuf) ;
 
+      /* write L events + removed DNA S lines to .1taco */
       int j ;
       for (j = 0 ; j < arrayMax(seqLift) ; ++j)
 	{ SalsaEntry *se = arrp(seqLift, j, SalsaEntry) ;
@@ -362,7 +365,8 @@ static int tacoCollapse (int argc, char *argv[])
 	  oneInt(ofTaco,3) = se->unit_len ;
 	  oneWriteLine (ofTaco, 'L', 0, 0) ;
 	  I64 removedLen = se->orig_end - se->orig_start - se->unit_len ;
-	  oneWriteLine (ofSeq, 'S', removedLen, inSeq + se->orig_start + se->unit_len) ;
+	  if (removedLen > 0)
+	    oneWriteLine (ofTaco, 'S', removedLen, inSeq + se->orig_start + se->unit_len) ;
 	}
 
       if (fastaIO)
@@ -413,69 +417,24 @@ static int tacoReconstruct (int argc, char *argv[])
   oneSchemaDestroy (seqSchema) ;
   if (!ofSeq) die ("failed to open %s", argv[1]) ;
 
-  /* read coordinate map only (no DNA) */
-  Salsa *salsas = salsaRead (ofTaco, (int)nSeq) ;
+  /* read coordinate map (with removed DNA) + compressed seqs */
+  Salsa *salsas = salsaReadWithSeq (ofTaco, ofSeq, (int)nSeq) ;
   oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
 
   /* open output */
   if (!outFileName) outFileName = "-" ; /* stdout */
   SeqIO *outIO = seqIOopenWrite (outFileName, 0, dna2textConv, 0) ;
   if (!outIO) die ("failed to open %s to write", outFileName) ;
 
-  /* allocate one pair of reusable buffers sized to the largest sequence */
-  I64 maxOrigLen = 0, maxTacoLen = 0 ;
   int i ;
   for (i = 0 ; i < (int)nSeq ; ++i)
-    { if (salsas[i].origLen > maxOrigLen) maxOrigLen = salsas[i].origLen ;
-      if (salsas[i].tacoLen > maxTacoLen) maxTacoLen = salsas[i].tacoLen ;
-    }
-  char *tacoSeq = new (maxTacoLen + 1, char) ;
-  char *origBuf = new (maxOrigLen + 1, char) ;
-
-  /* stream through .1seq one sequence at a time: no all-at-once loading */
-  for (i = 0 ; i < (int)nSeq ; ++i)
     { Salsa *s = &salsas[i] ;
-
-      /* read taco'd sequence -- copy out before reading removed DNA lines */
-      if (!oneReadLine (ofSeq) || ofSeq->lineType != 'S')
-	die ("expected S line for tacoSeq of sequence %d", i) ;
-      memcpy (tacoSeq, oneDNAchar(ofSeq), s->tacoLen) ;
-
-      /* reconstruct directly into origBuf, reading removed DNA on the fly */
-      I64 tacoPos = 0, origPos = 0 ;
-      int j ;
-      for (j = 0 ; j < s->n ; ++j)
-	{ SalsaEntry *e = &s->entry[j] ;
-	  I64 gap = e->taco_pos - tacoPos ;
-	  if (gap > 0)
-	    { memcpy (origBuf+origPos, tacoSeq+tacoPos, gap) ;
-	      origPos += gap ; tacoPos += gap ;
-	    }
-	  if (e->unit_len > 0)
-	    { memcpy (origBuf+origPos, tacoSeq+tacoPos, e->unit_len) ;
-	      origPos += e->unit_len ; tacoPos += e->unit_len ;
-	    }
-	  /* read removed DNA directly from .1seq into origBuf */
-	  if (!oneReadLine (ofSeq) || ofSeq->lineType != 'S')
-	    die ("expected S line for removed DNA of seq %d event %d", i, j) ;
-	  I64 removedLen = oneLen(ofSeq) ;
-	  if (removedLen > 0)
-	    { memcpy (origBuf+origPos, oneDNAchar(ofSeq), removedLen) ;
-	      origPos += removedLen ;
-	    }
-	}
-      I64 tail = s->tacoLen - tacoPos ;
-      if (tail > 0)
-	{ memcpy (origBuf+origPos, tacoSeq+tacoPos, tail) ;
-	  origPos += tail ;
-	}
-      origBuf[origPos] = 0 ;
-      seqIOwrite (outIO, s->seqName ? s->seqName : "unknown", 0, s->origLen, origBuf, 0) ;
+      char *orig = salsaReconstruct (s) ;
+      seqIOwrite (outIO, s->seqName ? s->seqName : "unknown", 0, s->origLen, orig, 0) ;
+      free (orig) ;
     }
 
-  newFree (tacoSeq, maxTacoLen + 1, char) ;
-  newFree (origBuf, maxOrigLen + 1, char) ;
-  oneFileClose (ofSeq) ;
   seqIOclose (outIO) ;
   salsaDestroy (salsas, (int)nSeq) ;
   return 0 ;

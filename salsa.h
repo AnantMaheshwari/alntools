@@ -32,6 +32,7 @@ static char salsaSchemaText[] =
   "D I 1 6 STRING              sequence identifier\n"
   "G L                         sequence (c) groups lift entries (L)\n"
   "O L 4 3 INT 3 INT 3 INT 3 INT  lift event: orig_start orig_end taco_pos unit_len\n"
+  "D S 1 3 DNA                 removed DNA for this event (len = orig_end-orig_start-unit_len)\n"
 ;
 
 /****************** data structures ******************/

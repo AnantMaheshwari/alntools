@@ -93,6 +93,9 @@ void salsaWrite (OneFile *of, Salsa *salsas, int nSeq)
           oneInt(of,2) = e->taco_pos ;
           oneInt(of,3) = e->unit_len ;
           oneWriteLine (of, 'L', 0, 0) ;
+          I64 removedLen = e->orig_end - e->orig_start - e->unit_len ;
+          if (e->removed && removedLen > 0)
+            oneWriteLine (of, 'S', removedLen, e->removed) ;
         }
     }
 }
@@ -137,6 +140,16 @@ Salsa *salsaRead (OneFile *of, int nSeq)
           e->removed    = 0 ;
         }
         break ;
+      case 'S':
+        /* removed DNA for the immediately preceding L event */
+        if (arrayMax(entryArr) > 0)
+          { SalsaEntry *e = arrp (entryArr, arrayMax(entryArr) - 1, SalsaEntry) ;
+            I64 len = oneLen(of) ;
+            e->removed = new (len + 1, char) ;
+            memcpy (e->removed, oneDNAchar(of), len) ;
+            e->removed[len] = 0 ;
+          }
+        break ;
       }
 
   /* finalise last sequence */
@@ -166,59 +179,30 @@ Salsa *salsaRead (OneFile *of, int nSeq)
 
 void salsaWriteWithSeq (OneFile *ofTaco, OneFile *ofSeq, Salsa *salsas, int nSeq)
 {
-  int i, j ;
+  /* coordinate map + removed DNA now all live in .1taco via salsaWrite */
+  salsaWrite (ofTaco, salsas, nSeq) ;
+  /* .1seq holds only the compressed sequence: one S line per sequence */
+  int i ;
   for (i = 0 ; i < nSeq ; ++i)
-    { Salsa *s = &salsas[i] ;
-      /* write c line to .1taco */
-      oneInt(ofTaco,0) = s->origLen ;
-      oneInt(ofTaco,1) = s->tacoLen ;
-      oneWriteLine (ofTaco, 'c', 0, 0) ;
-      if (s->seqName)
-	oneWriteLine (ofTaco, 'I', strlen(s->seqName), s->seqName) ;
-      /* write compressed sequence to .1seq */
-      oneWriteLine (ofSeq, 'S', s->tacoLen, s->tacoSeq) ;
-      /* write L events and removed DNA */
-      for (j = 0 ; j < s->n ; ++j)
-        { SalsaEntry *e = &s->entry[j] ;
-          oneInt(ofTaco,0) = e->orig_start ;
-          oneInt(ofTaco,1) = e->orig_end ;
-          oneInt(ofTaco,2) = e->taco_pos ;
-          oneInt(ofTaco,3) = e->unit_len ;
-          oneWriteLine (ofTaco, 'L', 0, 0) ;
-          I64 removedLen = e->orig_end - e->orig_start - e->unit_len ;
-          oneWriteLine (ofSeq, 'S', removedLen, e->removed) ;
-        }
-    }
+    oneWriteLine (ofSeq, 'S', salsas[i].tacoLen, salsas[i].tacoSeq) ;
 }
 
 Salsa *salsaReadWithSeq (OneFile *ofTaco, OneFile *ofSeq, int nSeq)
 {
-  /* first read the coordinate map */
+  /* read coordinate map + removed DNA from .1taco */
   Salsa *salsas = salsaRead (ofTaco, nSeq) ;
 
-  /* now read the .1seq file to populate tacoSeq and removed DNA */
-  int seq = -1, ev = -1 ;
-  while (oneReadLine (ofSeq))
+  /* read one compressed sequence per entry from .1seq */
+  int seq = 0 ;
+  while (seq < nSeq && oneReadLine (ofSeq))
     { if (ofSeq->lineType != 'S') continue ;
-      if (ev < 0 || (seq >= 0 && ev >= salsas[seq].n))
-        { /* this S is the compressed sequence for the next c */
-          ++seq ;
-          if (seq >= nSeq) die ("too many sequences in .1seq file") ;
-          I64 len = oneLen(ofSeq) ;
-          salsas[seq].tacoSeq = new (len + 1, char) ;
-          memcpy (salsas[seq].tacoSeq, oneDNAchar(ofSeq), len) ;
-          salsas[seq].tacoSeq[len] = 0 ;
-          ev = 0 ;
-        }
-      else
-        { /* this S is the removed DNA for event ev of current seq */
-          I64 len = oneLen(ofSeq) ;
-          salsas[seq].entry[ev].removed = new (len + 1, char) ;
-          memcpy (salsas[seq].entry[ev].removed, oneDNAchar(ofSeq), len) ;
-          salsas[seq].entry[ev].removed[len] = 0 ;
-          ++ev ;
-        }
+      I64 len = oneLen(ofSeq) ;
+      salsas[seq].tacoSeq = new (len + 1, char) ;
+      memcpy (salsas[seq].tacoSeq, oneDNAchar(ofSeq), len) ;
+      salsas[seq].tacoSeq[len] = 0 ;
+      ++seq ;
     }
+  if (seq != nSeq) die ("salsaReadWithSeq: expected %d sequences in .1seq, got %d", nSeq, seq) ;
   return salsas ;
 }
 
