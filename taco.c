@@ -5,7 +5,7 @@
  * Description: TAndem COmpressor
  *   Subcommands: compress, collapse, reconstruct, chain, merge, lift, info
  * HISTORY:
- * Last edited: Nov 16 12:57 2025 (rd109)
+ * Last edited: Nov 11 21:52 2026 (am3320)
  * Created: Sat Nov 15 23:37:43 2025 (rd109)
  * Update: Mon Apr 6 20:20 2025 (am3320) - composable .1taco + .1seq system
  * Update: Aug 23 2026 (am3320) - latest TACO/SALSA versions
