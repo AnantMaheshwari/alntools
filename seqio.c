@@ -114,17 +114,28 @@ SeqIO *seqIOopenRead (char *filename, int* convert, bool isQual)
 	}
       si->type = ONE ; // important that this is after successful open
       si->handle = vf ;
-      if (vf->info['S']->given.count)
-	{ si->nSeq = vf->info['S']->given.count ;
-	  si->totSeqLen = vf->info['S']->given.total ;
-	  si->maxSeqLen = vf->info['S']->given.max ;
-	  si->seqBuf = new0 (si->maxSeqLen+1,char) ;
+      I64 scafCount = 0 ;
+      if (vf->info['s']) oneStats (vf, 's', &scafCount, 0, 0) ;
+      si->isScaffold = (scafCount > 0) ;
+      if (si->isScaffold)
+	{ si->nSeq = scafCount ;
+	  if (vf->info['S']) si->maxSeqLen = vf->info['S']->given.max ;
+	  si->seqBuf = new0 (si->maxSeqLen+1, char) ;
+	  while (oneReadLine (vf) && vf->lineType != 's') ;
+	}
+      else
+	{ if (vf->info['S']->given.count)
+	    { si->nSeq = vf->info['S']->given.count ;
+	      si->totSeqLen = vf->info['S']->given.total ;
+	      si->maxSeqLen = vf->info['S']->given.max ;
+	      si->seqBuf = new0 (si->maxSeqLen+1,char) ;
+	    }
+	  while (oneReadLine (vf) && vf->lineType != 'S') ;
 	}
       if (si->isQual && vf->info['Q'] && vf->info['Q']->given.count)
 	si->qualBuf = new0 (si->maxSeqLen+1,char) ;
       else
 	si->isQual = false ;
-      while (oneReadLine (vf) && vf->lineType != 'S') ; // move up to first sequence line
       si->seqStart = 0 ;
     }
 #endif
@@ -250,6 +261,54 @@ static void bufHardRefill (SeqIO *si, U64 n) /* like bufRefill() but for bufConf
 bool seqIOread (SeqIO *si)
 {
 #ifdef ONEIO
+  if (si->type == ONE && si->isScaffold)
+    { OneFile *vf = (OneFile*) si->handle ;
+      if (vf->lineType != 's') return false ; // at end of file
+      si->seqLen = oneInt(vf, 0) ; // scaffold length from s line field 0
+      if (si->seqLen > si->maxSeqLen)
+	{ if (si->maxSeqLen) free (si->seqBuf) ;
+	  si->maxSeqLen = si->seqLen ;
+	  si->seqBuf = new0 (si->maxSeqLen+1, char) ;
+	}
+      /* id is field 1 (STRING) of s */
+      si->idLen = oneLen(vf) ;
+      si->descLen = 0 ; si->descStart = 0 ;
+      while (si->idLen + 2 > si->bufSize) bufDouble (si) ;
+      si->idStart = 0 ;
+      memcpy (si->buf, oneString(vf), si->idLen) ;
+      si->buf[si->idLen] = 0 ;
+      U64 pos = 0 ;
+      while (oneReadLine (vf))
+	{ if (vf->lineType == 's') break ;
+	  if (vf->lineType == 'S')
+	    { U64 sl = oneLen(vf) ;
+	      if (pos + sl > si->seqLen) die ("scaffold S overflow: %llu+%llu > %llu",
+	                                      (unsigned long long)pos, (unsigned long long)sl,
+	                                      (unsigned long long)si->seqLen) ;
+	      if (si->convert)
+		{ char *d = si->seqBuf + pos, *e = d + sl, *sv = oneString(vf) ;
+		  while (d < e) *d++ = si->convert[(int)*sv++] ;
+		}
+	      else
+		memcpy (si->seqBuf + pos, oneString(vf), sl) ;
+	      pos += sl ;
+	    }
+	  else if (vf->lineType == 'n')
+	    { U64 nl = oneInt(vf, 1) ;
+	      char base = oneChar(vf, 0) ;
+	      if (si->convert) base = si->convert[(int)base] ;
+	      if (pos + nl > si->seqLen) die ("scaffold n overflow: %llu+%llu > %llu",
+	                                      (unsigned long long)pos, (unsigned long long)nl,
+	                                      (unsigned long long)si->seqLen) ;
+	      memset (si->seqBuf + pos, base, nl) ;
+	      pos += nl ;
+	    }
+	}
+      if (pos != si->seqLen)
+	die ("scaffold %s: declared len %llu but got %llu",
+	     sqioId(si), (unsigned long long)si->seqLen, (unsigned long long)pos) ;
+      return true ;
+    }
   if (si->type == ONE)
     { OneFile *vf = (OneFile*) si->handle ;
       if (vf->lineType != 'S') return false ; // at end of file

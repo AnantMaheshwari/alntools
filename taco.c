@@ -8,12 +8,51 @@
  * Last edited: Nov 16 12:57 2025 (rd109)
  * Created: Sat Nov 15 23:37:43 2025 (rd109)
  * Update: Mon Apr 6 20:20 2025 (am3320) - composable .1taco + .1seq system
+ * Update: Aug 23 2026 (am3320) - latest TACO/SALSA versions
  *-------------------------------------------------------------------
  */
 
 #include "alntools.h"
 #include "seqio.h"
 #include "salsa.h"
+
+/****************** .1seq schema with scaffold structure ******************/
+/* Matches FasTAN/FastLTR's expected layout so the FA reader and .1seq reader
+   produce the same contig structure. */
+
+static char *scaffoldSeqSchemaText =
+  "1 3 def 2 1\n"
+  ".\n"
+  "P 3 seq                     SEQUENCE\n"
+  "O s 2 3 INT 6 STRING        length and id for a scaffold (group of contigs)\n"
+  "G S                         scaffolds (s) group sequence objects (S)\n"
+  "D n 2 4 CHAR 3 INT          non-acgt run between contigs within a scaffold\n"
+  "O S 1 3 DNA                 sequence (one contig)\n" ;
+
+static void writeScaffoldSeq (OneFile *ofSeq, char *seq, I64 len, char *id)
+{
+  oneInt(ofSeq, 0) = len ;
+  oneWriteLine (ofSeq, 's', strlen(id), id) ;
+
+  I64 i = 0 ;
+  while (i < len)
+    { I64 contigStart = i ;
+      while (i < len && seq[i] != 'N' && seq[i] != 'n') ++i ;
+      I64 contigLen = i - contigStart ;
+      if (contigLen > 0)
+        oneWriteLine (ofSeq, 'S', contigLen, seq + contigStart) ;
+
+      I64 gapStart = i ;
+      char gapChar = (i < len) ? seq[i] : 'N' ;  // preserve case from input
+      while (i < len && (seq[i] == 'N' || seq[i] == 'n')) ++i ;
+      I64 gapLen = i - gapStart ;
+      if (gapLen > 0)
+        { oneChar(ofSeq, 0) = gapChar ;
+          oneInt(ofSeq, 1) = gapLen ;
+          oneWriteLine (ofSeq, 'n', 0, 0) ;
+        }
+    }
+}
 
 /****************** compress subcommand ******************/
 
@@ -66,10 +105,10 @@ static int tacoCompress (int argc, char *argv[])
   if (!ofTaco) die ("failed to open %s to write", tacoFileName) ;
   oneAddProvenance (ofTaco, "taco", VERSION, getCommandLine()) ;
 
-  /* open .1seq output */
+  /* open .1seq output (scaffold-aware: s + S/n alternating) */
   char seqFileName[1024] ;
   snprintf (seqFileName, sizeof(seqFileName), "%s.1seq", outPrefix) ;
-  OneSchema *seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  OneSchema *seqSchema = oneSchemaCreateFromText (scaffoldSeqSchemaText) ;
   OneFile *ofSeq = oneFileOpenWriteNew (seqFileName, seqSchema, "seq", true, 1) ;
   oneSchemaDestroy (seqSchema) ;
   if (!ofSeq) die ("failed to open %s to write", seqFileName) ;
@@ -131,9 +170,22 @@ static int tacoCompress (int argc, char *argv[])
       if (!dictFind (gdb->seqDict, id, &seq))
 	die ("failed to match name %s in %s to %s", sqioId(inIO), argv[1], argv[0]) ;
       if (id != sqioId(inIO)) free (id) ;
-      if (inIO->seqLen != gdb->seqLen[seq])
-	die ("length mismatch for seq %s: %d in %s, %d in %s",
-	     sqioId(inIO), gdb->seqLen[seq], argv[0], inIO->seqLen, argv[1]) ;
+      if (inIO->seqLen > (U64) gdb->seqLen[seq])
+	{ char *s = sqioSeq(inIO) ;
+	  I64   j ;
+	  for (j = gdb->seqLen[seq] ; j < (I64) inIO->seqLen ; ++j)
+	    if (s[j] != 'N' && s[j] != 'n') break ;
+	  if (j < (I64) inIO->seqLen)
+	    die ("length mismatch for seq %s: %lld in %s, %lld in %s - surplus is not all N",
+		 sqioId(inIO), (long long) gdb->seqLen[seq], argv[0],
+		 (long long) inIO->seqLen, argv[1]) ;
+	  warn ("seq %s: ignoring %lld trailing N in %s that are absent from the GDB in %s",
+		sqioId(inIO), (long long) (inIO->seqLen - gdb->seqLen[seq]), argv[1], argv[0]) ;
+	}
+      else if (inIO->seqLen != (U64) gdb->seqLen[seq])
+	die ("length mismatch for seq %s: %lld in %s, %lld in %s",
+	     sqioId(inIO), (long long) gdb->seqLen[seq], argv[0],
+	     (long long) inIO->seqLen, argv[1]) ;
 
       U64   nNew = 0, nOld = 0 ;
       char *oldSeq = sqioSeq(inIO) ;
@@ -167,9 +219,10 @@ static int tacoCompress (int argc, char *argv[])
       oneWriteLine (ofTaco, 'c', 0, 0) ;
       oneWriteLine (ofTaco, 'I', strlen(sqioId(inIO)), sqioId(inIO)) ;
 
-      /* write .1seq: compressed sequence first, then removed DNA directly from source */
-      oneWriteLine (ofSeq, 'S', nNew, tacoSeq) ;
+      /* write .1seq: scaffold (s) + contigs (S) + gaps (n) */
+      writeScaffoldSeq (ofSeq, tacoSeq, nNew, sqioId(inIO)) ;
 
+      /* write L events + removed DNA S lines to .1taco */
       int j ;
       for (j = 0 ; j < arrayMax(seqLift) ; ++j)
 	{ SalsaEntry *e = arrp(seqLift, j, SalsaEntry) ;
@@ -179,7 +232,8 @@ static int tacoCompress (int argc, char *argv[])
 	  oneInt(ofTaco,3) = e->unit_len ;
 	  oneWriteLine (ofTaco, 'L', 0, 0) ;
 	  I64 removedLen = e->orig_end - e->orig_start - e->unit_len ;
-	  oneWriteLine (ofSeq, 'S', removedLen, oldSeq + e->orig_start + e->unit_len) ;
+	  if (removedLen > 0)
+	    oneWriteLine (ofTaco, 'S', removedLen, oldSeq + e->orig_start + e->unit_len) ;
 	}
 
       /* optionally write FASTA */
@@ -278,10 +332,10 @@ static int tacoCollapse (int argc, char *argv[])
   if (!ofTaco) die ("failed to open %s to write", tacoFileName) ;
   oneAddProvenance (ofTaco, "taco", VERSION, getCommandLine()) ;
 
-  /* open .1seq output */
+  /* open .1seq output (scaffold-aware: s + S/n alternating) */
   char seqFileName[1024] ;
   snprintf (seqFileName, sizeof(seqFileName), "%s.1seq", outPrefix) ;
-  OneSchema *seqSchema = oneSchemaCreateFromText (seqioSchemaText) ;
+  OneSchema *seqSchema = oneSchemaCreateFromText (scaffoldSeqSchemaText) ;
   OneFile *ofSeq = oneFileOpenWriteNew (seqFileName, seqSchema, "seq", true, 1) ;
   oneSchemaDestroy (seqSchema) ;
   if (!ofSeq) die ("failed to open %s to write", seqFileName) ;
@@ -320,6 +374,11 @@ static int tacoCollapse (int argc, char *argv[])
 	for (i = seqStartArr[seqIdx] ;
 	     i < arrayMax(events) && arrp(events,i,CollapseEvent)->seq == seqIdx ; ++i)
 	  { CollapseEvent *ce = arrp(events, i, CollapseEvent) ;
+		    if (ce->start < 0 || ce->end > seqLen || ce->start >= ce->end)
+		      { warn ("out-of-range event seq %d [%lld,%lld) vs scaffold len %lld; skipping",
+			      seqIdx, (long long)ce->start, (long long)ce->end, (long long)seqLen) ;
+			continue ;
+		      }
 	    if (ce->start < (I64)nOld)
 	      { if (ce->start + ce->unit > ce->end)
 		  warn ("buried event seq %d at %lld when cursor at %lld",
@@ -350,9 +409,10 @@ static int tacoCollapse (int argc, char *argv[])
       oneWriteLine (ofTaco, 'c', 0, 0) ;
       oneWriteLine (ofTaco, 'I', strlen(sqioId(inIO)), sqioId(inIO)) ;
 
-      /* write .1seq: compressed sequence */
-      oneWriteLine (ofSeq, 'S', nNew, outBuf) ;
+      /* write .1seq: scaffold (s) + contigs (S) + gaps (n) */
+      writeScaffoldSeq (ofSeq, outBuf, nNew, sqioId(inIO)) ;
 
+      /* write L events + removed DNA S lines to .1taco */
       int j ;
       for (j = 0 ; j < arrayMax(seqLift) ; ++j)
 	{ SalsaEntry *se = arrp(seqLift, j, SalsaEntry) ;
@@ -362,7 +422,8 @@ static int tacoCollapse (int argc, char *argv[])
 	  oneInt(ofTaco,3) = se->unit_len ;
 	  oneWriteLine (ofTaco, 'L', 0, 0) ;
 	  I64 removedLen = se->orig_end - se->orig_start - se->unit_len ;
-	  oneWriteLine (ofSeq, 'S', removedLen, inSeq + se->orig_start + se->unit_len) ;
+	  if (removedLen > 0)
+	    oneWriteLine (ofTaco, 'S', removedLen, inSeq + se->orig_start + se->unit_len) ;
 	}
 
       if (fastaIO)
@@ -413,69 +474,24 @@ static int tacoReconstruct (int argc, char *argv[])
   oneSchemaDestroy (seqSchema) ;
   if (!ofSeq) die ("failed to open %s", argv[1]) ;
 
-  /* read coordinate map only (no DNA) */
-  Salsa *salsas = salsaRead (ofTaco, (int)nSeq) ;
+  /* read coordinate map (with removed DNA) + compressed seqs */
+  Salsa *salsas = salsaReadWithSeq (ofTaco, ofSeq, (int)nSeq) ;
   oneFileClose (ofTaco) ;
+  oneFileClose (ofSeq) ;
 
   /* open output */
   if (!outFileName) outFileName = "-" ; /* stdout */
   SeqIO *outIO = seqIOopenWrite (outFileName, 0, dna2textConv, 0) ;
   if (!outIO) die ("failed to open %s to write", outFileName) ;
 
-  /* allocate one pair of reusable buffers sized to the largest sequence */
-  I64 maxOrigLen = 0, maxTacoLen = 0 ;
   int i ;
   for (i = 0 ; i < (int)nSeq ; ++i)
-    { if (salsas[i].origLen > maxOrigLen) maxOrigLen = salsas[i].origLen ;
-      if (salsas[i].tacoLen > maxTacoLen) maxTacoLen = salsas[i].tacoLen ;
-    }
-  char *tacoSeq = new (maxTacoLen + 1, char) ;
-  char *origBuf = new (maxOrigLen + 1, char) ;
-
-  /* stream through .1seq one sequence at a time: no all-at-once loading */
-  for (i = 0 ; i < (int)nSeq ; ++i)
     { Salsa *s = &salsas[i] ;
-
-      /* read taco'd sequence -- copy out before reading removed DNA lines */
-      if (!oneReadLine (ofSeq) || ofSeq->lineType != 'S')
-	die ("expected S line for tacoSeq of sequence %d", i) ;
-      memcpy (tacoSeq, oneDNAchar(ofSeq), s->tacoLen) ;
-
-      /* reconstruct directly into origBuf, reading removed DNA on the fly */
-      I64 tacoPos = 0, origPos = 0 ;
-      int j ;
-      for (j = 0 ; j < s->n ; ++j)
-	{ SalsaEntry *e = &s->entry[j] ;
-	  I64 gap = e->taco_pos - tacoPos ;
-	  if (gap > 0)
-	    { memcpy (origBuf+origPos, tacoSeq+tacoPos, gap) ;
-	      origPos += gap ; tacoPos += gap ;
-	    }
-	  if (e->unit_len > 0)
-	    { memcpy (origBuf+origPos, tacoSeq+tacoPos, e->unit_len) ;
-	      origPos += e->unit_len ; tacoPos += e->unit_len ;
-	    }
-	  /* read removed DNA directly from .1seq into origBuf */
-	  if (!oneReadLine (ofSeq) || ofSeq->lineType != 'S')
-	    die ("expected S line for removed DNA of seq %d event %d", i, j) ;
-	  I64 removedLen = oneLen(ofSeq) ;
-	  if (removedLen > 0)
-	    { memcpy (origBuf+origPos, oneDNAchar(ofSeq), removedLen) ;
-	      origPos += removedLen ;
-	    }
-	}
-      I64 tail = s->tacoLen - tacoPos ;
-      if (tail > 0)
-	{ memcpy (origBuf+origPos, tacoSeq+tacoPos, tail) ;
-	  origPos += tail ;
-	}
-      origBuf[origPos] = 0 ;
-      seqIOwrite (outIO, s->seqName ? s->seqName : "unknown", 0, s->origLen, origBuf, 0) ;
+      char *orig = salsaReconstruct (s) ;
+      seqIOwrite (outIO, s->seqName ? s->seqName : "unknown", 0, s->origLen, orig, 0) ;
+      free (orig) ;
     }
 
-  newFree (tacoSeq, maxTacoLen + 1, char) ;
-  newFree (origBuf, maxOrigLen + 1, char) ;
-  oneFileClose (ofSeq) ;
   seqIOclose (outIO) ;
   salsaDestroy (salsas, (int)nSeq) ;
   return 0 ;
@@ -763,6 +779,55 @@ static int tacoInfo (int argc, char *argv[])
   return 0 ;
 }
 
+/****************** windows subcommand ******************/
+
+static int tacoWindows (int argc, char *argv[])
+{
+  I64 flank = 0 ;
+  while (argc >= 2 && **argv == '-')
+    { if (!strcmp(*argv, "-f")) { flank = strtoll (argv[1], 0, 10) ; argc -= 2 ; argv += 2 ; }
+      else break ;
+    }
+
+  if (argc != 1)
+    { fprintf (stderr, "Usage: taco windows [-f <flank>] <input.1taco>\n") ;
+      return 1 ;
+    }
+
+  OneSchema *schema = oneSchemaCreateFromText (salsaSchemaText) ;
+  OneFile *of = oneFileOpenRead (argv[0], schema, "taco", 1) ;
+  oneSchemaDestroy (schema) ;
+  if (!of) die ("failed to open %s", argv[0]) ;
+
+  I64 nSeq = 0 ;
+  oneStats (of, 'c', &nSeq, 0, 0) ;
+  Salsa *salsas = salsaRead (of, (int)nSeq) ;
+  oneFileClose (of) ;
+
+  int i, j ;
+  for (i = 0 ; i < (int)nSeq ; ++i)
+    { Salsa *s = &salsas[i] ;
+      if (s->seqName == NULL) continue ;
+      I64 curBeg = -1, curEnd = -1 ;
+      for (j = 0 ; j < s->n ; ++j)
+	{ I64 b = s->entry[j].taco_pos - flank ;
+	  I64 e = s->entry[j].taco_pos + s->entry[j].unit_len + flank ;
+	  if (b < 0) b = 0 ;
+	  if (e > s->tacoLen) e = s->tacoLen ;
+	  if (b >= e) continue ;
+	  if (curBeg < 0) { curBeg = b ; curEnd = e ; }
+	  else if (b <= curEnd) { if (e > curEnd) curEnd = e ; }
+	  else { printf ("%s\t%lld\t%lld\n", s->seqName, (long long)curBeg, (long long)curEnd) ;
+	         curBeg = b ; curEnd = e ; }
+	}
+      if (curBeg >= 0)
+	printf ("%s\t%lld\t%lld\n", s->seqName, (long long)curBeg, (long long)curEnd) ;
+    }
+
+  salsaDestroy (salsas, (int)nSeq) ;
+  return 0 ;
+}
+
 /****************** main dispatcher ******************/
 
 int main (int argc, char *argv[])
@@ -781,7 +846,8 @@ int main (int argc, char *argv[])
 	       "  chain        flatten multiple .1taco + .1seq layers into one\n"
 	       "  merge        merge non-overlapping .1taco + .1seq on same original\n"
 	       "  lift         coordinate liftover through .1taco file(s)\n"
-	       "  info         print summary of .1taco file\n") ;
+	       "  info         print summary of .1taco file\n"
+		       "  windows      .1taco -> scan windows near compressed regions \n") ;
       return 1 ;
     }
 
@@ -792,6 +858,7 @@ int main (int argc, char *argv[])
   else if (!strcmp(argv[0], "merge"))       return tacoMergeCmd    (argc-1, argv+1) ;
   else if (!strcmp(argv[0], "lift"))        return tacoLift        (argc-1, argv+1) ;
   else if (!strcmp(argv[0], "info"))        return tacoInfo        (argc-1, argv+1) ;
+  else if (!strcmp(argv[0], "windows"))     return tacoWindows     (argc-1, argv+1) ;
   else
     { fprintf (stderr, "Unknown subcommand: %s\n", argv[0]) ;
       return 1 ;

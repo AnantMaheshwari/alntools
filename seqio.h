@@ -67,6 +67,7 @@ typedef struct {
   U64   idStart, descStart, seqStart, qualStart ;
   bool  isQual ;       		/* if set then convert qualities by subtracting 33 (FASTQ) */
   int   qualThresh ;		/* used for binary representation of qualities */
+  bool  isScaffold ;		/* ONE: if true, file uses s/S/n scaffold layout */
   /* below here private */
   U64   bufSize ;
   U64   nb ;			/* nb is how many characters left to read in the buffer */
