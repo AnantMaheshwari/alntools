@@ -102,7 +102,7 @@ static int tacoCompress (int argc, char *argv[])
 	else if (ofIn->lineType == 'U') t->unit = oneInt(ofIn,0) ;
     }
   oneFileClose (ofIn) ;
-  arraySort (at, tanSort) ;
+  arraySort (at, tanLineCompareSeq) ;
 
   /* build seqStart lookup */
   int i ;

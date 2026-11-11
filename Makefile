@@ -1,11 +1,11 @@
 # makefile for alntools
 
-CFLAGS = -O3
-#CFLAGS = -g	# for debugging
+CFLAGS = -O3 -DUTILS_THREADSAFE
+#CFLAGS = -g -DUTILS_THREADSAFE	# for debugging
 
-LIBS = -lpthread -lz
+LIBS = -lpthread -lz -lm
 
-ALL = tanbed gdbmask svfind taco ONEview
+ALL = tanbed gdbmask svfind taco ONEview tancons satmatch satscan
 
 DESTDIR = ~/bin
 
@@ -28,7 +28,12 @@ ONElib.o: ONElib.h
 
 tanbed.o: alntools.h ONElib.h $(UTILS_HEADERS)
 
-gdb.o: alntools.h ONElib.h $(UTILS_HEADERS)
+tancons.o: alntools.h ONElib.h $(UTILS_HEADERS)
+
+gdb.o: alntools.h ONElib.h seqio.h $(UTILS_HEADERS)
+
+satscan.o: onerep.h alntools.h satscore.h seqio.h ONElib.h $(UTILS_HEADERS)
+satscore.o: satscore.h $(UTILS_HEADERS)
 
 SEQIO_OPTS = -DONEIO
 seqio.o: seqio.c seqio.h ONElib.h $(UTILS_HEADERS)
@@ -40,10 +45,13 @@ alncode.o: alncode.h align.h
 
 ### programs
 
-tanbed: tanbed.o gdb.o ONElib.o $(UTILS_OBJS)
+tanbed: tanbed.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-gdbmask: gdb.c ONElib.o $(UTILS_OBJS)
+tancons: tancons.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+gdbmask: gdb.c seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) -D GDB_MASK $(CFLAGS) -o $@ $^ $(LIBS)
 
 salsa.o: salsa.h ONElib.h $(UTILS_HEADERS)
@@ -51,7 +59,13 @@ salsa.o: salsa.h ONElib.h $(UTILS_HEADERS)
 taco: taco.c salsa.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-svfind: svfind.c alnseq.o alncode.o seqio.o ONElib.o $(UTILS_OBJS)
+svfind: svfind.c alnseq.o alncode.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+satmatch: satmatch.c satscore.o seqio.o ONElib.o $(UTILS_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+satscan: satscan.o satscore.o gdb.o seqio.o ONElib.o $(UTILS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 ONEview: ONEview.c ONElib.o

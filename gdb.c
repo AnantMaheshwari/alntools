@@ -5,20 +5,25 @@
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Nov 16 10:04 2025 (rd109)
+ * Last edited: Oct 25 23:47 2026 (claude)
  * Created: Sun Oct 19 21:45:26 2025 (rd109)
  *-------------------------------------------------------------------
  */
 
 #include "alntools.h"
+#include "array.h"
+#include "seqio.h"
+#include <ctype.h>
 
 void reportGdb (Gdb *gdb, FILE *f)
 { fprintf (f, "%d seqs %d contigs (%d gaps)", gdb->nSeq, gdb->nCtg, gdb->nGap) ;
   fprintf (f, ", totSeq %lld totCtg %lld (%.3f%%)", (long long) gdb->totSeq,
 	   (long long) gdb->totCtg, gdb->totCtg/(0.01*gdb->totSeq)) ;
+ #ifdef GDB_MASK
   if (gdb->totMask)
     fprintf (f, ", %d masks totMask %lld (%.1f%%)",
-	     (int) gdb->maxMask/2, (long long) gdb->totMask, gdb->totMask/(0.01*gdb->totSeq)) ;
+  	     (int) gdb->maxMask/2, (long long) gdb->totMask, gdb->totMask/(0.01*gdb->totSeq)) ;
+#endif
   fputc ('\n', f) ;
 }
 
@@ -33,17 +38,19 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
   
   oneStats (of, 'S', &gdb->maxSeq, 0, 0) ;
   oneStats (of, 'C', &gdb->maxCtg, 0, 0) ;
-  oneStats (of, 'M', 0, 0, &gdb->maxMask) ;
   gdb->seqDict = dictCreate (gdb->maxSeq) ;
   gdb->seqLen = new0 (gdb->maxSeq, I64) ;
   gdb->ctgLen = new0 (gdb->maxCtg, I64) ;
   gdb->ctgSeq = new0 (gdb->maxCtg, int) ;
   gdb->ctgPos = new0 (gdb->maxCtg, I64) ;
-  if (gdb->maxMask)
+ #ifdef GDB_MASK
+   oneStats (of, 'M', 0, 0, &gdb->maxMask) ;
+   if (gdb->maxMask)
     { gdb->ctgMaskCount = new0 (gdb->maxCtg, int) ;
       gdb->ctgMaskStart = new0 (gdb->maxCtg, int) ;
       gdb->mask = new0 (gdb->maxMask, I64) ;
     }
+ #endif
 
   if (!strcmp (of->fileType, "gdb"))	// stand alone
     oneGoto (of, 'S', 0) ; 		// go to the start of the data
@@ -66,10 +73,17 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
 	gdb->isUpper = true ;
 	break ;
       case 'S':
+	{ char *s = oneString(of) ; while (*s && *s != ' ' && *s != '\t') s++ ; *s = 0 ; }
 	dictAdd (gdb->seqDict, oneString(of), 0) ;
 	if (gdb->nSeq > 0) gdb->seqLen[gdb->nSeq-1] = end ;
 	end = 0 ; // reset counter
 	++gdb->nSeq ;
+	break ;
+      case 'c':
+	if (!gdb->nSeq) die ("c line before S line in GDB") ;
+	if (!gdb->chromNames) gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+	gdb->chromNames[gdb->nSeq-1] = new (oneLen(of)+1, char) ;
+	strcpy (gdb->chromNames[gdb->nSeq-1], oneString(of)) ;
 	break ;
       case 'G':
 	if (!gdb->nSeq) die ("G line before S line in GDB") ;
@@ -87,6 +101,7 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
 	gdb->totCtg += oneInt(of,0) ;
 	++gdb->nCtg ;
 	break ;
+#ifdef GDB_MASK     
       case 'M':
 	if (!gdb->nCtg) die ("M line before C line in GDB") ;
 	if (oneLen(of) % 2) die ("size of Mask list must be even") ;
@@ -98,6 +113,7 @@ Gdb *readGdb (OneFile *of, int k, FILE *report) // don't report if !report
 	I64 *m = oneIntList(of) ;
 	for (i = 0 ; i < oneLen(of) ; i += 2) gdb->totMask += m[i+1] - m[i] ;
 	break ;
+#endif
       default: // anything else (including another 'g') is the end of this GDB
 	isDone = true ;
 	break ;
@@ -130,6 +146,8 @@ void writeGdb (OneFile *of, Gdb *gdb, int k, FILE *report)
   for (i = 0 ; i < gdb->nSeq ; ++i)
     { char *name = dictName(gdb->seqDict,i) ;
       oneWriteLine (of, 'S', strlen(name), name) ;
+      if (gdb->chromNames && gdb->chromNames[i])
+	oneWriteLine (of, 'c', strlen(gdb->chromNames[i]), gdb->chromNames[i]) ;
       end = 0 ;
       while (j < gdb->nCtg && gdb->ctgSeq[j] == i)
 	{ if (gdb->ctgPos[j] > end)
@@ -140,8 +158,10 @@ void writeGdb (OneFile *of, Gdb *gdb, int k, FILE *report)
 	  oneInt(of,0) = gdb->ctgLen[j] ;
 	  oneWriteLine (of, 'C', 0, 0) ;
 	  end += gdb->ctgLen[j] ;
+#ifdef GDB_MASK     
 	  if (gdb->totMask && gdb->ctgMaskCount[j])
 	    oneWriteLine (of, 'M', gdb->ctgMaskCount[j], &gdb->mask[gdb->ctgMaskStart[j]]) ;
+#endif
 	  ++j ;
 	}
       if (end < gdb->seqLen[i])
@@ -164,12 +184,178 @@ void gdbDestroy (Gdb *gdb)
   newFree (gdb->ctgLen, gdb->maxCtg, I64) ;
   newFree (gdb->ctgSeq, gdb->maxCtg, int) ;
   newFree (gdb->ctgPos, gdb->maxCtg, I64) ;
+  if (gdb->chromNames)
+    { for (int i = 0 ; i < gdb->maxSeq ; ++i)
+	if (gdb->chromNames[i]) newFree (gdb->chromNames[i], strlen(gdb->chromNames[i])+1, char) ;
+      newFree (gdb->chromNames, gdb->maxSeq, char*) ;
+    }
+#ifdef GDB_MASK
   if (gdb->maxMask)
     { newFree (gdb->ctgMaskCount, gdb->maxCtg, int) ;
       newFree (gdb->ctgMaskStart, gdb->maxCtg, int) ;
       newFree (gdb->mask, gdb->maxMask, I64) ;
     }
+#endif
   newFree (gdb, 1, Gdb) ;
+}
+
+/************ naming chromosomes from the sequence names ************/
+
+// Sets gdb->chromNames, unless it is already set (e.g. from c lines), in one of three ways:
+// (a) If any sequence name starts with chr, Chr or CHR, each such sequence is a chromosome, named with the
+//     prefix chr, e.g. ChrX becomes chrX; chrM, ChrM, mito, Mito, mitochondrion and Mitochondrion are mito.
+// (b) Otherwise, if the names are INSDC accessions, i.e. capital letters and underscores, then digits, then
+//     . and a version number, as from NCBI or ENA, the initial run of sequences whose prefix of letters and
+//     underscores is the same as the first one's are chromosomes, named chr1, chr2, ... in order, except
+//     that one shorter than MITO_MAX is mito. Later sequences, e.g. scaffolds, have other prefixes. If the
+//     first prefix is NW_ or NT_, RefSeq's prefixes for scaffolds and contigs, there are no chromosomes.
+// (c) Otherwise, sequences named by a single letter A to F are the Drosophila Muller elements, named MullerA
+//     to MullerF.
+// Otherwise no chromosomes are named. Mitochondria of plants and protists can be longer than MITO_MAX.
+
+#define MITO_MAX 50000
+
+static char *stringCopy (char *s) { char *t = new (strlen(s)+1, char) ; strcpy (t, s) ; return t ; }
+
+static bool isMitoName (char *s)
+{ return !strcmp (s, "chrM") || !strcmp (s, "ChrM") || !strcmp (s, "mito") || !strcmp (s, "Mito")
+    || !strcmp (s, "mitochondrion") || !strcmp (s, "Mitochondrion") ;
+}
+
+static int insdcPrefixLen (char *s) // length of the prefix of an INSDC accession, else 0
+{
+  char *t = s ;
+  while ((*t >= 'A' && *t <= 'Z') || *t == '_') ++t ;
+  int len = t - s ;
+  if (!len || !isdigit(*t)) return 0 ;
+  while (isdigit(*t)) ++t ;
+  if (*t++ != '.' || !isdigit(*t)) return 0 ;
+  while (isdigit(*t)) ++t ;
+  return *t ? 0 : len ;
+}
+
+void gdbMakeChromosomes (Gdb *gdb)
+{
+  if (gdb->chromNames || !gdb->nSeq) return ;
+  int i ;
+  for (i = 0 ; i < gdb->nSeq ; ++i)
+    { char *name = dictName(gdb->seqDict, i) ;
+      if (!strncmp (name, "chr", 3) || !strncmp (name, "Chr", 3) || !strncmp (name, "CHR", 3)) break ;
+    }
+  if (i < gdb->nSeq)	// (a)
+    { gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+      for (i = 0 ; i < gdb->nSeq ; ++i)
+	{ char *name = dictName(gdb->seqDict, i) ;
+	  if (isMitoName (name))
+	    gdb->chromNames[i] = stringCopy ("mito") ;
+	  else if (!strncmp (name, "chr", 3) || !strncmp (name, "Chr", 3) || !strncmp (name, "CHR", 3))
+	    { gdb->chromNames[i] = new (strlen(name)+1, char) ;
+	      strcpy (gdb->chromNames[i], "chr") ; strcpy (gdb->chromNames[i]+3, name+3) ;
+	    }
+	}
+      return ;
+    }
+  char *first = dictName(gdb->seqDict, 0) ;	// (b)
+  int prefixLen = insdcPrefixLen (first) ;
+  if (!prefixLen)	// (c)
+    { for (i = 0 ; i < gdb->nSeq ; ++i)
+	{ char *name = dictName(gdb->seqDict, i) ;
+	  if (name[0] >= 'A' && name[0] <= 'F' && !name[1])
+	    { if (!gdb->chromNames) gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+	      char buf[8] ; sprintf (buf, "Muller%c", name[0]) ; gdb->chromNames[i] = stringCopy (buf) ;
+	    }
+	}
+      return ;
+    }
+  if (prefixLen == 3 && (!strncmp (first, "NW_", 3) || !strncmp (first, "NT_", 3))) return ;
+  gdb->chromNames = new0 (gdb->maxSeq, char*) ;
+  int nChrom = 0 ;
+  for (i = 0 ; i < gdb->nSeq ; ++i)
+    { char *name = dictName(gdb->seqDict, i) ;
+      if (insdcPrefixLen (name) != prefixLen || strncmp (name, first, prefixLen)) break ;
+      if (gdb->seqLen[i] < MITO_MAX)
+	gdb->chromNames[i] = stringCopy ("mito") ;
+      else
+	{ char buf[32] ; sprintf (buf, "chr%d", ++nChrom) ; gdb->chromNames[i] = stringCopy (buf) ; }
+    }
+}
+
+/************ building a Gdb from sequences as they are read ************/
+
+struct GdbBuilderStruct {
+  Gdb   *gdb ;		// counts and totals are kept here as sequences are added
+  Array  seqLen, ctgLen, ctgSeq, ctgPos ;	// of I64, I64, int, I64
+} ;
+
+static bool isGdbBase[256] ;	// ACGTacgt: any other character is in a gap
+
+GdbBuilder *gdbBuilderCreate (char *seqFileName)
+{
+  if (!isGdbBase['a']) for (char *c = "ACGTacgt" ; *c ; ++c) isGdbBase[(int)*c] = true ;
+  GdbBuilder *gb = new0 (1, GdbBuilder) ;
+  gb->gdb = new0 (1, Gdb) ;
+  gb->gdb->seqFileName = seqFileName ;
+  gb->gdb->seqDict = dictCreate (1024) ;
+  gb->seqLen = arrayCreate (1024, I64) ;
+  gb->ctgLen = arrayCreate (1024, I64) ;
+  gb->ctgSeq = arrayCreate (1024, int) ;
+  gb->ctgPos = arrayCreate (1024, I64) ;
+  return gb ;
+}
+
+void gdbAddSequence (GdbBuilder *gb, char *name, char *seq, I64 len) // seq is text
+{
+  Gdb *gdb = gb->gdb ;
+  if (!dictAdd (gdb->seqDict, name, 0)) die ("duplicate sequence name %s in %s", name, gdb->seqFileName) ;
+  array(gb->seqLen, gdb->nSeq, I64) = len ;
+  gdb->totSeq += len ;
+  I64 i = 0 ;
+  while (i < len)
+    { I64 j = i ;
+      if (isGdbBase[(U8)seq[i]])
+	{ while (j < len && isGdbBase[(U8)seq[j]]) ++j ;
+	  array(gb->ctgLen, gdb->nCtg, I64) = j - i ;
+	  array(gb->ctgSeq, gdb->nCtg, int) = gdb->nSeq ;
+	  array(gb->ctgPos, gdb->nCtg, I64) = i ;
+	  gdb->totCtg += j - i ;
+	  ++gdb->nCtg ;
+	}
+      else
+	{ while (j < len && !isGdbBase[(U8)seq[j]]) ++j ;
+	  ++gdb->nGap ;
+	}
+      i = j ;
+    }
+  ++gdb->nSeq ;
+}
+
+// copy the arrays into allocations of exactly nSeq and nCtg, as gdbDestroy() expects
+Gdb *gdbFromBuilder (GdbBuilder *gb)
+{
+  Gdb *gdb = gb->gdb ;
+  gdb->maxSeq = gdb->nSeq ; gdb->maxCtg = gdb->nCtg ;
+  gdb->seqLen = new (gdb->nSeq, I64) ; memcpy (gdb->seqLen, arrp(gb->seqLen,0,I64), gdb->nSeq*sizeof(I64)) ;
+  gdb->ctgLen = new (gdb->nCtg, I64) ; memcpy (gdb->ctgLen, arrp(gb->ctgLen,0,I64), gdb->nCtg*sizeof(I64)) ;
+  gdb->ctgSeq = new (gdb->nCtg, int) ; memcpy (gdb->ctgSeq, arrp(gb->ctgSeq,0,int), gdb->nCtg*sizeof(int)) ;
+  gdb->ctgPos = new (gdb->nCtg, I64) ; memcpy (gdb->ctgPos, arrp(gb->ctgPos,0,I64), gdb->nCtg*sizeof(I64)) ;
+  arrayDestroy (gb->seqLen) ; arrayDestroy (gb->ctgLen) ; arrayDestroy (gb->ctgSeq) ; arrayDestroy (gb->ctgPos) ;
+  newFree (gb, 1, GdbBuilder) ;
+  return gdb ;
+}
+
+Gdb *gdbMakeFromFile (char *seqFileName, FILE *report)
+{
+  SeqIO *sio = seqIOopenRead (seqFileName, 0, false) ; // no conversion: gaps need the original characters
+  if (!sio) die ("failed to open sequence file %s", seqFileName) ;
+  GdbBuilder *gb = gdbBuilderCreate (seqFileName) ;
+  while (seqIOread (sio)) gdbAddSequence (gb, sqioId(sio), sqioSeq(sio), sio->seqLen) ;
+  seqIOclose (sio) ;
+  Gdb *gdb = gdbFromBuilder (gb) ;
+  if (report)
+    { fprintf (report, "made GDB from %s : ", seqFileName) ;
+      reportGdb (gdb, report) ;
+    }
+  return gdb ;
 }
 
 /********************** main function for gdbmask ******************************/
@@ -229,7 +415,7 @@ int main (int argc, char *argv[])
       bl = arrayp (ab, arrayMax(ab), TanLine) ;
     }
   --arrayMax(ab) ;
-  arraySort (ab, tanSort) ; // need to ensure it is sorted
+  arraySort (ab, tanLineCompareSeq) ; // need to ensure it is sorted
   fprintf (stdout, "read %lld bed lines from %s\n", (long long)arrayMax(ab), argv[1]) ;
   fclose (f) ;
 

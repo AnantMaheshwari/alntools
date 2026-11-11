@@ -7,7 +7,8 @@
  *  Copyright (C) Richard Durbin, Cambridge University and Eugene Myers 2019-
  *
  * HISTORY:
- * Last edited: Oct 12 23:35 2025 (rd109)
+ * Last edited: Oct 13 00:54 2026 (rd109)
+ * * May 14 16:34 2026 (rd109): made list (including DNA) read/write work with len > 2G
  * * Oct  2 09:30 2025 (rd109): add localPath in OpenRead to try <path>.1<type> if <path> fails
  * * May  1 00:23 2024 (rd109): moved to OneInfo->index and multiple objects/groups
  * * Apr 16 18:59 2024 (rd109): major change to object and group indexing: 0 is start of data
@@ -74,15 +75,15 @@ static pthread_mutex_t mutexInit = PTHREAD_MUTEX_INITIALIZER;
 // RD 220818: I think that many of int below should be I64, e.g. for len, ilen etc.
 
 OneCodec *vcCreate();
-void      vcAddToTable(OneCodec *vc, int len, char *bytes);
+void      vcAddToTable(OneCodec *vc, I64 len, char *bytes);
 void      vcAddHistogram(OneCodec *vc, OneCodec *vh);
 void      vcCreateCodec(OneCodec *vc, int partial);
 void      vcDestroy(OneCodec *vc);
 int       vcMaxSerialSize();
 int       vcSerialize(OneCodec *vc, void *out);
 OneCodec *vcDeserialize(void *in);
-int       vcEncode(OneCodec *vc, int ilen, char *ibytes, char *obytes);
-int       vcDecode(OneCodec *vc, int ilen, char *ibytes, char *obytes);
+I64       vcEncode(OneCodec *vc, I64 ilen, char *ibytes, char *obytes);
+I64       vcDecode(OneCodec *vc, I64 ilen, char *ibytes, char *obytes);
 
 // forward declarations of 64-bit integer encoding/decoding
 
@@ -303,14 +304,16 @@ OneSchema *oneSchemaCreateFromFile (const char *filename)
   // first load the universal header and footer (non-alphabetic) line types 
   // do this by writing their schema into a temporary file and parsing it into the base schema
   { errno = 0 ;
-    char template[64] ;
 // #define VALGRIND_MACOS
+    char template[4096] ;
+    const char *tmpdir = getenv("TMPDIR") ;
+    if (!tmpdir) tmpdir = "/tmp" ;
 #ifdef VALGRIND_MACOS // MacOS valgrind is missing functions to make temp files it seems
-    sprintf (template, "/tmp/OneSchema.%d", getpid()) ;
+    snprintf (template, sizeof(template), "%s/OneSchema-%d", getpid()) ;
     vf->f = fopen (template, "w+") ;
     if (errno) die ("failed to open temporary file %s errno %d\n", template, errno) ;
 #else
-    strcpy (template, "/tmp/OneSchema.XXXXXX") ;
+    snprintf (template, sizeof(template), "%s/OneSchema-XXXXXX", tmpdir) ;
     int fd = mkstemp (template) ;
     if (errno) die ("failed to open temporary file %s errno %d\n", template, errno) ;
     vf->f = fdopen (fd, "w+") ;
@@ -393,7 +396,10 @@ OneSchema *oneSchemaCreateFromText (const char *text) // write to temp file and 
   // static char template[64] ;
   // sprintf (template, "/tmp/OneTextSchema-%d.schema", getpid()) ;
   
-  char template[] = "/tmp/OneTextSchema-XXXXXX" ;
+  char template[4096];
+  const char *tmpdir = getenv("TMPDIR");
+  if (!tmpdir) tmpdir = "/tmp";
+  snprintf(template, sizeof(template), "%s/OneTextSchema-XXXXXX", tmpdir);
   errno = 0 ;
   int fd = mkstemp(template) ;
   if (fd == -1) die ("failed to make temporary file %s for writing schema to - errno %d", template, errno) ;
@@ -736,7 +742,7 @@ static void oneFileDestroy (OneFile *vf)
 static void parseDie (OneFile *vf, char *format, ...)
 { va_list args;
 
-  fprintf (stderr, "OneFile parse error: ");
+  fprintf (stderr, "OneFile %s parse error: ", vf->fileName);
 
   va_start (args, format);
   vfprintf (stderr, format, args);
@@ -852,6 +858,7 @@ static inline void readFlush (OneFile *vf) // reads to the end of the line and s
     { li->bufSize = 1024 ;
       li->buffer = new (li->bufSize, char) ;
     }
+  
   while ((x = getc (vf->f)) && x != '\n')
     if (x == EOF)
       parseDie (vf, "premature end of file");
@@ -1103,7 +1110,7 @@ char oneReadLine (OneFile *vf)
 
   li = vf->info[(int) t];
   if (li == NULL)
-    parseDie (vf, "unknown line type %c (%d was %d) line %d", t, t, x, (int)vf->line);
+    parseDie (vf, "unknown line type %c (%d was %d)", t, t, x);
   if (li->accum.count >= 0) // after goto set to -1 for unindexed linetypes - can't know the count
     li->accum.count += 1 ;  // includes update of indexed type counts
 
@@ -1214,7 +1221,12 @@ char oneReadLine (OneFile *vf)
             }
 
           if (li->fieldType[li->listField] == oneSTRING)
-            ((char *) li->buffer)[listLen] = '\0'; // 0 terminate
+	    { if (!li->buffer) // edge case - it may be 0 if all strings in a file are length 0
+		{ li->bufSize = 32 ;
+		  li->buffer = new (32, char) ;
+		}
+	      ((char *) li->buffer)[listLen] = '\0'; // 0 terminate
+	    }
         }
 
     doneLine:
@@ -1369,9 +1381,14 @@ OneFile *oneFileOpenRead (const char *path, OneSchema *vsArg, const char *fileTy
     else
       { f = fopen (path, "r");
 	if (!f && fileType)
-	  { char *localPath = malloc (strlen(path) + strlen(fileType) + 2) ;
-	    strcpy (localPath, path) ; strcat (localPath, ".") ; strcat (localPath, fileType) ;
-	    f = fopen (localPath, "r") ;
+	  { char *lp = (char*) malloc (strlen(path) + strlen(fileType) + 3) ;
+	    sprintf (lp, "%s.1%s", path, fileType) ;   // try the binary ending <path>.1<type> first
+	    f = fopen (lp, "r") ;
+		    if (!f)   // then the ascii ending <path>.<type>
+		      { sprintf (lp, "%s.%s", path, fileType) ;
+			f = fopen (lp, "r") ;
+		      }
+		    if (f) localPath = lp ; else free (lp) ;
 	  }
 	if (!f) return 0 ;
       }
@@ -1557,7 +1574,7 @@ OneFile *oneFileOpenRead (const char *path, OneSchema *vsArg, const char *fileTy
 		    parseDie (vf, "unrecognised symbol %c", c);
 		}
 		break;
-            } /*  */
+            }
 	  }
 	  break;
 
@@ -1663,7 +1680,7 @@ OneFile *oneFileOpenRead (const char *path, OneSchema *vsArg, const char *fileTy
 
       if (strcmp (path, "-") == 0) die ("ONE error: parallel input incompatible with stdin as input");
 
-      for (i = 1 ; i < nthreads ; ++i) files[i] = fopen (path, "r") ;
+      for (i = 1 ; i < nthreads ; ++i) files[i] = fopen (localPath, "r") ;
       vf->share = nthreads ;
       vf = readThreadMake (vf, vs0, files) ;
       free (files) ;
@@ -2159,6 +2176,9 @@ bool oneStats (OneFile *of, char lineType, I64 *count, I64 *max, I64 *total)
   if (!info)  return false ;
   
   OneCounts   counts = of->isWrite ? info->accum : info->given ;
+  if (lineType == '>' || lineType == '<' || lineType == '!')
+    counts = info->accum ; // true and safe - not sure why we did it this way - 260111
+					    
   if (count) *count = counts.count ;
   if (max)   *max   = counts.max ;
   if (total) *total = counts.total ;
@@ -2575,7 +2595,7 @@ void oneWriteLine (OneFile *vf, char t, I64 listLen, void *listBuf)
     }
 }
 
-int Uncompress_DNA(char *s, int len, char *t) ; // forward declaration for temp solution below
+I64 Uncompress_DNA(char *s, I64 len, char *t) ; // forward declaration for temp solution below
 
 void oneWriteLineDNA2bit (OneFile *vf, char lineType, I64 len, U8 *dnaBuf) // NB len in bp
 { // temporary solution
@@ -2831,7 +2851,7 @@ void oneFileClose (OneFile *vf)
   //    to operate.  You can destroy/free it with vcDestroy.
 
 OneCodec *vcCreate();
-void      vcAddToTable(OneCodec *vc, int len, char *bytes);
+void      vcAddToTable(OneCodec *vc, I64 len, char *bytes);
 void      vcCreateCodec(OneCodec *vc, int partial);
 void      vcDestroy(OneCodec *vc);
 
@@ -2853,8 +2873,8 @@ void      vcPrint(OneCodec *vc, FILE *to);
   //    ilen is the number of bits in the compressed input, and the return value
   //    is the number of bytes in the uncompressed output.  The routines are endian safe.
 
-int       vcEncode(OneCodec *vc, int ilen, char *ibytes, char *obytes);
-int       vcDecode(OneCodec *vc, int ilen, char *ibytes, char *obytes);
+I64       vcEncode(OneCodec *vc, I64 ilen, char *ibytes, char *obytes);
+I64       vcDecode(OneCodec *vc, I64 ilen, char *ibytes, char *obytes);
 
   //  Rather than directly reading or writing an encoding of a compressor, the routines
   //    below serialize or deserialize the compressor into/outof a user-supplied buffer.
@@ -2968,10 +2988,10 @@ void vcDestroy(OneCodec *vc)
   //  Add the frequencies of bytes in bytes[0..len) to vc's histogram
   //    State becomes FILLED
 
-void vcAddToTable(OneCodec *vc, int len, char *bytes)
+void vcAddToTable(OneCodec *vc, I64 len, char *bytes)
 { _OneCodec *v = (_OneCodec *) vc;
   uint8 *data = (uint8 *) bytes;
-  int i;
+  I64 i;
 
   for (i = 0; i < len; i++)
     v->hist[(int) data[i]] += 1;
@@ -3440,8 +3460,8 @@ static uint8 Number[128] =
   //  Richard switched to little-endian December 2022 - big-endian remains in comments
   //  should detect endianness and check and/or switch
 
-int Compress_DNA(int len, char *s, char *t)
-{ int    i, j;
+I64 Compress_DNA(I64 len, char *s, char *t)
+{ I64    i, j;
   uint8 *s0, *s1, *s2, *s3;
 
   s0 = (uint8 *) s;
@@ -3476,11 +3496,12 @@ int Compress_DNA(int len, char *s, char *t)
   //  Encode ibytes[0..ilen) according to compressor vc and place in obytes
   //  Return the # of bits used.
 
-int vcEncode(OneCodec *vc, int ilen, char *ibytes, char *obytes)
+I64 vcEncode(OneCodec *vc, I64 ilen, char *ibytes, char *obytes)
 { _OneCodec *v = (_OneCodec *) vc;
 
   uint64  c, ocode, *ob;
-  int     n, k, rem, tbits, ibits, esc, elen;
+  I64     k, tbits, ibits;
+  int     n, rem, esc, elen;
   uint8  *clens, x, *bcode, *bb;
   uint16 *cbits;
 
@@ -3574,8 +3595,9 @@ int vcEncode(OneCodec *vc, int ilen, char *ibytes, char *obytes)
 
 static char Base[4] = { 'a', 'c', 'g', 't' };
 
-int Uncompress_DNA(char *s, int len, char *t)
-{ int   i, tlen, byte;
+I64 Uncompress_DNA(char *s, I64 len, char *t)
+{ I64   i, tlen;
+  int   byte;
   char *t0, *t1, *t2, *t3;
 
   t0 = t;
@@ -3618,7 +3640,7 @@ int Uncompress_DNA(char *s, int len, char *t)
   //  Decode ilen bits in ibytes, into obytes according to vc's codec
   //  Return the number of bytes decoded.
 
-int vcDecode(OneCodec *vc, int ilen, char *ibytes, char *obytes)
+I64 vcDecode(OneCodec *vc, I64 ilen, char *ibytes, char *obytes)
 { _OneCodec *v = (_OneCodec *) vc;
 
   char   *look;
@@ -3626,7 +3648,8 @@ int vcDecode(OneCodec *vc, int ilen, char *ibytes, char *obytes)
   uint64  icode, ncode, *p;
   int     rem, nem;
   uint8   c, *o;
-  int     n, k, elen, inbig, esc;
+  I64     k;
+  int     n, elen, inbig, esc;
 
   if (vc == DNAcodec)
     return (Uncompress_DNA(ibytes,ilen>>1,obytes));
@@ -3634,7 +3657,7 @@ int vcDecode(OneCodec *vc, int ilen, char *ibytes, char *obytes)
   if (v->state < CODED_WITH) die("vcDecode: Compressor does not have a codec");
 
   if (*((uint8 *) ibytes) == 0xff)
-    { int olen = (ilen>>3)-1;
+    { I64 olen = (ilen>>3)-1;
       memcpy(obytes,ibytes+1,olen);
       return (olen);
     }

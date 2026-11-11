@@ -26,7 +26,7 @@
  * Exported functions:
  *              See Header file: array.h (includes lots of macros)
  * HISTORY:
- * Last edited: Aug 11 22:57 2024 (rd109)
+ * Last edited: Oct 20 16:10 2026 (claude)
  * * Feb 14 11:21 2011 (rd): modified in 2009/10 by RD for stand-alone use
  * Created: Thu Dec 12 15:43:25 1989 (mieg)
  *-------------------------------------------------------------------
@@ -39,7 +39,9 @@
 static U64 totalAllocatedMemory = 0 ;
 static U64 totalNumberCreated = 0 ;
 static U64 totalNumberActive = 0 ;
-static Array reportArray = 0 ;
+static Array reportArray = 0 ;	/* ARRAY_REPORT is a single-threaded debugging aid: reportArray and the
+				   isFirst flag in uArrayCreate() are unprotected shared state, so do not
+				   define ARRAY_REPORT in code that creates arrays from several threads */
 
 #define arrayExists(a) ((a) && (a)->magic == ARRAY_MAGIC)
 
@@ -57,16 +59,16 @@ Array uArrayCreate (U64 n, U64 size)
   if (size <= 0) die ("negative size %d in uArrayCreate", size) ;
   if (n < 1)
     n = 1 ;
-  totalAllocatedMemory += n * size ;
+  atomicAdd (&totalAllocatedMemory, n * size) ;
 
   a->magic = ARRAY_MAGIC ;
   a->base = mycalloc (n, size) ;
   a->dim = n ;
   a->max = 0 ;
   a->size = size ;
-  ++totalNumberActive ;
+  atomicAdd (&totalNumberActive, 1) ;
 #ifdef ARRAY_REPORT
-  a->id = ++totalNumberCreated ;
+  a->id = atomicAdd (&totalNumberCreated, 1) ;
   if (reportArray)
     { if (a->id < ARRAY_REPORT_MAX)
 	array (reportArray, a->id, Array) = a ;
@@ -92,10 +94,10 @@ Array uArrayReCreate (Array a, U64 n, U64 size)
   if (n < 1) n = 1 ;
 
   if (a->dim < n || (a->dim - n)*size > (1 << 20) ) /* free if save > 1 MB */
-    { totalAllocatedMemory -= a->dim * size ;
-      free (a->base) ;
+    { atomicSub (&totalAllocatedMemory, a->dim * size) ;
+      myfree (a->base, a->dim * size) ;
       a->dim = n ;
-      totalAllocatedMemory += a->dim * size ;
+      atomicAdd (&totalAllocatedMemory, a->dim * size) ;
       /* base-mem isn't alloc'd on handle, it's free'd by finalisation */
       a->base = mycalloc (n, size) ;
     }
@@ -113,15 +115,15 @@ void arrayDestroy (Array a)
   if (!arrayExists (a))
     die ("arrayDestroy called on bad array %lx", (long unsigned int) a) ;
 
-  totalAllocatedMemory -= a->dim * a->size ;
-  totalNumberActive-- ;
+  atomicSub (&totalAllocatedMemory, a->dim * a->size) ;
+  atomicSub (&totalNumberActive, 1) ;
 #ifdef ARRAY_REPORT
   if (reportArray)
     arr(reportArray, a->id, Array) = 0 ;
 #endif
   a->magic = 0 ;
-  free (a->base) ;
-  free (a) ;
+  myfree (a->base, a->dim * a->size) ;
+  myfree (a, sizeof (struct ArrayStruct)) ;
 }
 
 /**************/
@@ -144,6 +146,7 @@ Array arrayCopy (Array a)
 void arrayExtend (Array a, U64 n) 
 {
   char *new ;
+  U64   oldDim ;
 
   if (!arrayExists (a))
     die ("arrayExtend called on bad array %lx", (long unsigned int) a) ;
@@ -151,7 +154,8 @@ void arrayExtend (Array a, U64 n)
   if (n < a->dim)
     return ;
 
-  totalAllocatedMemory -= a->dim * a->size ;
+  oldDim = a->dim ;
+  atomicSub (&totalAllocatedMemory, a->dim * a->size) ;
   if (a->dim*a->size < 1 << 23)	/* 8MB */
     a->dim *= 2 ;
   else
@@ -159,11 +163,11 @@ void arrayExtend (Array a, U64 n)
   if (n >= a->dim)
     a->dim = n + 1 ;
 
-  totalAllocatedMemory += a->dim * a->size ;
+  atomicAdd (&totalAllocatedMemory, a->dim * a->size) ;
 
   new = mycalloc (a->dim, a->size) ;
   memcpy (new,a->base,a->size*a->max) ;
-  free (a->base) ;
+  myfree (a->base, oldDim * a->size) ;
   a->base = new ;
 
   return;
@@ -220,11 +224,14 @@ bool    arrayWrite (Array a, FILE *f)
 Array   arrayRead (FILE *f)
 {
   Array a = new (1, struct ArrayStruct) ;
-  if (fread (a, sizeof(struct ArrayStruct), 1, f) != 1) return 0 ;
+  if (fread (a, sizeof(struct ArrayStruct), 1, f) != 1) { newFree (a, 1, struct ArrayStruct) ; return 0 ; }
   a->base = myalloc (a->size*a->dim) ;
-  if (fread (a->base, a->size, a->dim, f) != a->dim) { free(a) ; return 0 ; }
+  if (fread (a->base, a->size, a->dim, f) != a->dim)
+    { myfree (a->base, a->size*a->dim) ; newFree (a, 1, struct ArrayStruct) ; return 0 ; }
+  atomicAdd (&totalAllocatedMemory, a->dim * a->size) ; // balanced by arrayDestroy()
+  atomicAdd (&totalNumberActive, 1) ;
 #ifdef ARRAY_REPORT
-  a->id = ++totalNumberCreated ;
+  a->id = atomicAdd (&totalNumberCreated, 1) ;
   if (reportArray)
     { if (a->id < ARRAY_REPORT_MAX)
 	array (reportArray, a->id, Array) = a ;
